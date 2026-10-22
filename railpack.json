@@ -1,0 +1,6 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "packages": {
+    "1password": "2.39.0"
+  }
+}
