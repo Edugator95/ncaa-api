@@ -1,11 +1,57 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { getScheduleBySportAndDivision } from "../src/codes";
-import { app } from "../src/index";
+import { app, isAuthorized } from "../src/index";
+
+describe("Auth", () => {
+  const key = "test-key-0123456789";
+  const withKey = (k: string | null) => {
+    process.env.NCAA_HEADER_KEY = key;
+    const headers = k === null ? {} : { "x-ncaa-key": k };
+    return new Request("http://localhost/no-such-route", { headers });
+  };
+  afterEach(() => {
+    delete process.env.NCAA_HEADER_KEY;
+  });
+  it("rejects a missing key on any path, before routing", async () => {
+    expect((await app.handle(withKey(null))).status).toBe(401);
+  });
+  it("rejects a wrong key, including a same-length one", async () => {
+    expect((await app.handle(withKey("wrong"))).status).toBe(401);
+    expect((await app.handle(withKey("test-key-0123456780"))).status).toBe(401);
+  });
+  it("lets the right key through to routing", async () => {
+    expect((await app.handle(withKey(key))).status).toBe(400);
+  });
+  it("fails closed in production when the key is unset", () => {
+    const env = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      expect(isAuthorized(null)).toBe(false);
+      expect(isAuthorized("anything")).toBe(false);
+    } finally {
+      process.env.NODE_ENV = env;
+    }
+  });
+});
 
 describe("General", () => {
-  it("home route redirects to openapi", async () => {
-    const response = await app.handle(new Request("http://localhost/"));
-    expect(response.headers.get("Location")).toBe("/openapi");
+  it("removed routes are gone", async () => {
+    for (const path of ["/", "/openapi", "/logo/alabama"]) {
+      const response = await app.handle(new Request(`http://localhost${path}`));
+      expect(response.status).not.toBe(200);
+    }
+  });
+  it("path characters outside [A-Za-z0-9-/] return 400", async () => {
+    for (const path of ["/stats/..%2f..%2fx", "/schedule/a.b/d1/2026", "/standings/x%22/d1"]) {
+      const response = await app.handle(new Request(`http://localhost${path}`));
+      expect(response.status).toBe(400);
+    }
+  });
+  it("non-numeric year returns 422", async () => {
+    const response = await app.handle(
+      new Request("http://localhost/brackets/basketball-men/d1/20x6")
+    );
+    expect(response.status).toBe(422);
   });
   it("invalid route returns 400", async () => {
     const response = await app.handle(new Request("http://localhost/invalid"));

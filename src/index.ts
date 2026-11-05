@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import { getSemaphore } from "@henrygd/semaphore";
 import { Elysia, NotFoundError, t } from "elysia";
 import ExpiryMap from "expiry-map";
@@ -13,7 +14,6 @@ import {
   playByPlayHashes,
   teamStatsHashes,
 } from "./codes";
-import { openapiSpec } from "./openapi";
 import {
   convertToOldFormat,
   fetchGqlScoreboard,
@@ -45,6 +45,37 @@ const validRoutes = new Map([
   ["brackets", cache_5m],
 ]);
 
+//////////////////////////////////////////////////////////////////////////////
+///////////////////////////////// AUTH ///////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+
+// Fail closed (VAR-480): an empty or missing key used to switch auth off for
+// every route. In production that is now a startup error, not an open server.
+if (!process.env.NCAA_HEADER_KEY && process.env.NODE_ENV === "production") {
+  console.error("NCAA_HEADER_KEY is not set; refusing to start without auth");
+  process.exit(1);
+}
+
+const sha256 = (value: string) => createHash("sha256").update(value).digest();
+
+/**
+ * Constant-time check of the x-ncaa-key header. Both sides are hashed first
+ * so timingSafeEqual always compares equal-length buffers.
+ * Only an unset key outside production (local dev, tests) skips the check.
+ */
+export function isAuthorized(provided: string | null): boolean {
+  const key = process.env.NCAA_HEADER_KEY;
+  if (!key) return process.env.NODE_ENV !== "production";
+  if (provided === null) return false;
+  return timingSafeEqual(sha256(provided), sha256(key));
+}
+
+// Every path a caller legitimately sends is letters, digits, "-" and "/".
+// Anything else ("." for traversal, "%" for encoded tricks, "?", "&", quotes,
+// braces) could steer the upstream ncaa.com URLs built from the path.
+const SAFE_PATH = /^[A-Za-z0-9\-/]*$/;
+const YEAR = "^\\d{4}$";
+
 /** log message to console with timestamp */
 function log(str: string) {
   console.log(`[${new Date().toISOString().substring(0, 19).replace("T", " ")}] ${str}`);
@@ -55,42 +86,20 @@ function log(str: string) {
 //////////////////////////////////////////////////////////////////////////////
 
 export const app = new Elysia()
-  .use(openapiSpec)
+  // Runs before routing, so it covers every path, including ones that 404.
+  .onRequest(({ request }) => {
+    if (!isAuthorized(request.headers.get("x-ncaa-key"))) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    if (!SAFE_PATH.test(new URL(request.url).pathname)) {
+      return new Response("Invalid path", { status: 400 });
+    }
+  })
   .onError(({ error, code }) => {
     if (code === "VALIDATION") return error.detail(error.message);
   })
-  // redirect index to github page
-  .get("/", ({ redirect }) => redirect("/openapi"), { detail: { hide: true } })
-  // fetch and return logo svg
-  .get("/logo/:school", async ({ params: { school }, query: { dark }, set, status }) => {
-    const bgParam = dark !== undefined && dark !== "false" ? "bgd" : "bgl";
-    const url = `https://www.ncaa.com/sites/default/files/images/logos/schools/${bgParam}/${school.replace(".svg", "")}.svg`;
-    const res = await fetch(url);
-
-    if (!res.ok) {
-      return status(404, "Logo not found");
-    }
-
-    try {
-      const svgContent = await res.text();
-      set.headers["Content-Type"] = "image/svg+xml";
-      set.headers["Cache-Control"] = "public, max-age=604800";
-      return svgContent;
-    } catch (_) {
-      return status(500, "Error fetching data");
-    }
-  },
-    { detail: { hide: true } }
-  )
   // validate request / set cache key
-  .resolve(({ request, path, query: { page }, status }) => {
-    // validate custom header value
-    if (
-      process.env.NCAA_HEADER_KEY &&
-      request.headers.get("x-ncaa-key") !== process.env.NCAA_HEADER_KEY
-    ) {
-      return status(401);
-    }
+  .resolve(({ path, query: { page }, status }) => {
     // check that page param is an int
     if (page && !/^\d+$/.test(page)) {
       return status(400, "Page parameter must be an integer");
@@ -416,7 +425,7 @@ export const app = new Elysia()
       params: t.Object({
         sport: t.String(),
         division: t.String(),
-        year: t.String(),
+        year: t.String({ pattern: YEAR }),
       }),
     }
   )
@@ -438,12 +447,12 @@ export const app = new Elysia()
     { detail: { hide: true } }
   )
   .get("/schedule-alt/:sport/:division/:year", async ({ cache, cacheKey, params, status }) => {
-    const sportCode = newCodesBySport[params.sport as keyof typeof newCodesBySport].code;
+    const sportCode = newCodesBySport[params.sport]?.code;
     if (!sportCode) {
       return status(400, "Invalid sport");
     }
     const divisionCode = getDivisionCode(params.sport, params.division);
-    if (!divisionCode) {
+    if (!/^\d+$/.test(String(divisionCode))) {
       return status(400, "Invalid division");
     }
     const url = `https://sdataprod.ncaa.com/?extensions={"persistedQuery":{"version":1,"sha256Hash":"a25ad021179ce1d97fb951a49954dc98da150089f9766e7e85890e439516ffbf"}}&queryName=NCAA_schedules_today_web&variables={"sportCode":"${sportCode}","division":${divisionCode},"seasonYear":${params.year}}`;
@@ -457,7 +466,14 @@ export const app = new Elysia()
     cache.set(cacheKey, data);
     return data;
   },
-    { detail: { hide: true } }
+    {
+      detail: { hide: true },
+      params: t.Object({
+        sport: t.String(),
+        division: t.String(),
+        year: t.String({ pattern: YEAR }),
+      }),
+    }
   )
   // scoreboard route to fetch data from data.ncaa.com json endpoint
   .get("/scoreboard/:sport/*", async ({ cache, cacheKey, params, set, status }) => {
@@ -598,7 +614,7 @@ export const app = new Elysia()
   },
     { detail: { hide: true } }
   )
-  .listen(3000);
+  .listen(Number(process.env.PORT) || 3000);
 
 log(`Server is running at ${app.server?.url}`);
 
